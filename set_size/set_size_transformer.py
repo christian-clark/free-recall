@@ -1,0 +1,176 @@
+import argparse
+import numpy as np
+import random
+import sys
+import torch
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    GPTNeoXForCausalLM
+)
+
+GPT2_MODELS = [
+    "gpt2",
+    "gpt2-medium",
+    "gpt2-large",
+    "gpt2-xl"
+]
+
+LIST_COUNT = 500
+#LIST_COUNT = 5
+TARGET_LIST_LENGTHS = [1, 2, 4, 8, 16, 32, 64]
+#TARGET_LIST_LENGTHS = [1, 2, 4]
+PREFACE = "In the morning, I saw"
+CONTINUATION = "In the afternoon, I again encountered"
+
+
+def generate_name_lists(names_fn, names_per_list):
+    names = list()
+    for l in open(names_fn):
+        names.append(l.strip())
+    names = np.array(names)
+    name_lists = list()
+    for _ in range(LIST_COUNT):
+        random_names = np.random.choice(names, names_per_list, replace=False).tolist()
+        name_lists.append(random_names)
+    return name_lists
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("names")
+    parser.add_argument("model")
+    parser.add_argument("--checkpoint", '-c', type=int, help="Pythia checkpoint", default=None)
+    parser.add_argument("--seed", '-s', type=int, help="random seed")
+    parser.add_argument("--gpu", '-g', action="store_true", help="use GPU")
+    args = parser.parse_args()
+    if args.seed:
+        random.seed(args.seed)
+
+    if args.gpu:
+        device = "cuda"
+    else:
+        device = "cpu"
+
+    model_name = args.model
+    model_variant = model_name.split('/')[-1]
+    # checkpoint should only be given for Pythia models
+    checkpoint = args.checkpoint
+    if checkpoint:
+        assert "pythia" in model_variant
+    if model_name in GPT2_MODELS:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+    elif "linear" in model_variant:
+        from transformers import GPTNeoXLinearForCausalLM
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision="word")
+        model = GPTNeoXLinearForCausalLM.from_pretrained(model_name, revision="word")
+    elif "mamba2" in model_variant:
+        from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+        assert args.gpu, "GPU required for Mamba2"
+        tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+        model = MambaLMHeadModel.from_pretrained(model_name)
+    elif "alibi" in model_variant:
+        from transformers import GPTNeoXAlibiForCausalLM
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision="word")
+        model = GPTNeoXAlibiForCausalLM.from_pretrained(model_name, revision="word")
+    elif "fleeting" in model_variant:
+        from transformers import GPTNeoXFleetingForCausalLM
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision="word")
+        model = GPTNeoXFleetingForCausalLM.from_pretrained(model_name, revision="word")
+    elif "vanilla" in model_variant:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, revision="word")
+        model = GPTNeoXForCausalLM.from_pretrained(model_name, revision="word")
+    elif "pythia" in model_variant:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if checkpoint:
+            model = GPTNeoXForCausalLM.from_pretrained(
+                model_name,
+                revision=f"step{checkpoint}",
+                cache_dir=f"../cached_lms/{model_variant}/step{checkpoint}",
+            )
+        else:
+            model = GPTNeoXForCausalLM.from_pretrained(model_name)
+    else:
+        raise Exception("unsupported model variant")
+
+    model.eval()
+    model = model.to(device)
+    softmax = torch.nn.Softmax(dim=-1)
+    if "mamba2" in args.model:
+        bos_id = tokenizer.bos_token_id
+    else:
+        bos_id = model.config.bos_token_id
+
+    print("names setSize tgtIx baselineSurp surp surpRatio")
+    for list_len in TARGET_LIST_LENGTHS:
+        name_lists  = generate_name_lists(args.names, list_len)
+        for name_list in name_lists:
+            input_ids = [bos_id] + tokenizer(PREFACE).input_ids
+            # this logic deals with proper punctuation for 1, 2, and 3+
+            # name lists
+            if len(name_list) == 1:
+                name = name_list[0]
+                name_ids = tokenizer(" " + name + ".").input_ids
+                assert len(name_ids) == 2, "multi-token name?"
+                input_ids.extend(name_ids)
+            elif len(name_list) == 2:
+                name = name_list[0]
+                name_ids = tokenizer(" " + name + " and").input_ids
+                assert len(name_ids) == 2, "multi-token name?"
+                input_ids.extend(name_ids)
+                name = name_list[1]
+                name_ids = tokenizer(" " + name + ".").input_ids
+                assert len(name_ids) == 2, "multi-token name?"
+                input_ids.extend(name_ids)
+            else:
+                for n_ix, name in enumerate(name_list):
+                    #name_locs.append(len(input_ids))
+                    # "and" before final conjunct
+                    if n_ix == len(name_list) - 2:
+                        name_ids = tokenizer(" " + name + ", and").input_ids
+                        assert len(name_ids) == 3, "multi-token name?"
+                    elif n_ix == len(name_list) - 1:
+                        name_ids = tokenizer(" " + name + ".").input_ids
+                        assert len(name_ids) == 2, "multi-token name?"
+                    else:
+                        name_ids = tokenizer(" " + name + ",").input_ids
+                        assert len(name_ids) == 2, "multi-token name?"
+                    input_ids.extend(name_ids)
+
+            input_ids.extend(tokenizer(" " + CONTINUATION).input_ids)
+            if model_name in GPT2_MODELS:
+                model_input = torch.tensor(input_ids)
+            else:
+                model_input = torch.tensor(input_ids).unsqueeze(0)
+            model_input = model_input.to(device)
+            model_output = model(model_input)
+            # dim: length x vocab
+            surps = -torch.log2(softmax(model_output.logits.squeeze(0))).to("cpu")
+
+            baseline_input_ids = [bos_id] + tokenizer(CONTINUATION).input_ids
+            if model_name in GPT2_MODELS:
+                model_input = torch.tensor(baseline_input_ids)
+            else:
+                model_input = torch.tensor(baseline_input_ids).unsqueeze(0)
+            model_input = model_input.to(device)
+            model_output = model(model_input)
+            # dim: length x vocab
+            baseline_surps = -torch.log2(softmax(model_output.logits.squeeze(0))).to("cpu")
+
+            for nix, name in enumerate(name_list):
+                target_id = tokenizer(" " + name).input_ids
+                assert len(target_id) == 1, "multi-token name?"
+                target_surp = surps[-1, target_id].item()
+                baseline_target_surp = baseline_surps[-1, target_id].item()
+
+                print(
+                    ','.join(name_list), list_len, nix, baseline_target_surp, target_surp,
+                    target_surp/baseline_target_surp
+                )
+
+
+
+if __name__ == "__main__":
+    main()
