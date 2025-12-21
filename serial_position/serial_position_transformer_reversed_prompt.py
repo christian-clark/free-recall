@@ -88,7 +88,7 @@ def main():
             model = GPTNeoXForCausalLM.from_pretrained(
                 model_name,
                 revision=f"step{checkpoint}",
-                cache_dir=f"../cached_lms/{model_variant}/step{checkpoint}",
+                cache_dir=f"/users/PAS2157/ceclark/git/cued-recall/cached_lms/{model_variant}/step{checkpoint}",
             )
         else:
             model = GPTNeoXForCausalLM.from_pretrained(model_name)
